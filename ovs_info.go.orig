@@ -1,0 +1,256 @@
+package main
+
+import (
+    "os/exec"
+    "fmt"
+    "os"
+    "io"
+    "strings"
+    "encoding/csv"
+    "github.com/digitalocean/go-openvswitch/ovs"
+    "github.com/prometheus/client_golang/prometheus"
+    "github.com/prometheus/client_golang/prometheus/promhttp"
+    "net/http"
+    log "github.com/Sirupsen/logrus"
+)
+
+type ovsCollector struct {
+	bondInfo	*prometheus.Desc
+	ovsIntInfo	*prometheus.Desc
+	ovsIntStats	*prometheus.Desc
+
+}
+
+func newovsCollector() *ovsCollector  {
+        return &ovsCollector   {
+                bondInfo: prometheus.NewDesc("bondInfo",
+                        "Shows ovs bond information",
+                        []string{"local_host","bond","slaves"},
+                        nil,
+                ),
+                ovsIntInfo: prometheus.NewDesc("ovsIntInfo",
+                        "Shows ovs interface information",
+                        []string{"local_host","uuid","name","admin_state","link_state","link_speed",
+                        "error","duplex","link_resets","mtu","mac_in_use","ofport","status",
+                        "type"},
+                        nil,
+                ),
+                ovsIntStats: prometheus.NewDesc("ovsIntStats",
+                        "Shows ovs bond information",
+                        []string{"local_host","port","collisions","rx_bytes","rx_crc_err",
+			"rx_dropped","rx_errors","rx_frame_err","rx_over_err","rx_packets",
+			"tx_bytes","tx_dropped","tx_errors","tx_packets"},
+                        nil,
+                ),
+        }
+}
+
+func (collector *ovsCollector) Describe(ch chan<- *prometheus.Desc) {
+        ch <- collector.bondInfo
+        ch <- collector.ovsIntInfo
+        ch <- collector.ovsIntStats
+}
+
+// CSVToMap takes a reader and returns an array of dictionaries, using the header row as the keys
+func CSVToMap(reader io.Reader) []map[string]string {
+	r := csv.NewReader(reader)
+	rows := []map[string]string{}
+	var header []string
+	for {
+		record, err := r.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			log.Fatal(err)
+		}
+		if header == nil {
+			header = record
+		} else {
+			dict := map[string]string{}
+			for i := range header {
+				dict[header[i]] = record[i]
+			}
+			rows = append(rows, dict)
+		}
+	}
+	return rows
+}
+
+func StatsCSV(in string) []map[string]string {
+  result := strings.Replace(in,"}","", -1)
+  result2 := strings.Replace(result,"{","", -1)
+  stage1 := strings.Split(result2,",")
+ 
+  rows := []map[string]string{}
+  arr1 := make([]string, len(stage1))
+  arr2 := make([]string, len(stage1))
+  for _, st1 := range stage1 {
+    stage2 := strings.Split(st1,"=")
+    arr1 = append(arr1,stage2[0])
+    if len(stage2) > 1 {
+        if stage2[1] != "" {
+            arr2 = append(arr2,stage2[1])
+       } else {
+            arr2 = append(arr2,"")
+       }
+    }else{
+      stage2 = append(stage2,"")
+      arr2 = append(arr2,"")
+    }
+  }
+
+   dict := map[string]string{}
+   for i := range arr1 {
+          dict[arr1[i]] = arr2[i]
+   }
+   rows = append(rows, dict)
+  return rows
+}
+
+func BytesToString(b []byte) []string {
+    bh := strings.Split(string(b),"\n")
+    return bh
+}
+
+func CSVToMapTest(in string) []map[string]string {
+var test = CSVToMap(strings.NewReader(in))
+return test
+}
+
+
+func (collector *ovsCollector) Collect(ch chan<- prometheus.Metric) {
+  out,err := exec.Command("systemctl", "check", "openvswitch").CombinedOutput()
+  metricValue := float64(1)
+  hnamecmd := exec.Command("hostname")
+  hnameout, herr := hnamecmd.CombinedOutput()
+  if herr != nil {
+  
+  }
+  if err != nil {
+    if exitErr, ok := err.(*exec.ExitError); ok {
+      fmt.Printf("openvswitch service not found.  Exit code: %v\n", exitErr)
+    } else {
+      fmt.Printf("failed to run systemctl: %v", err)
+      os.Exit(1)
+    }
+  } else {
+    fmt.Printf("\n%v",out)
+    var binf []string
+    cmd4 := "ovs-appctl bond/list | sed 's/, /:/g' | awk '{print $1,$2,$4}' | tr ' ' ','"
+    bonds, err := exec.Command("bash","-c",cmd4).CombinedOutput(); if err != nil{
+        fmt.Printf("failed to get bonds: %v", err)
+    }else{
+        for _, element := range CSVToMapTest(string(bonds)) {
+           // fmt.Println("Key:", key, "=>", "Element:", element)
+           // fmt.Println(element["bond"])
+            ch <- prometheus.MustNewConstMetric(collector.bondInfo,
+            prometheus.CounterValue,
+            metricValue,
+            strings.TrimSuffix(string([]byte(hnameout)),"\n"),
+            element["bond"],
+            element["slaves"],
+            element["bondtype"])
+            sinf := strings.Split(element["slaves"],":")
+            for _, s := range sinf {
+               binf = append(binf,s)
+             }
+            }
+    }
+
+    // Create a *ovs.Client.  Specify ovs.OptionFuncs to customize it.
+    c := ovs.New(
+        // Prepend "sudo" to all commands.
+        ovs.Sudo(),
+    )
+
+    //cmd1 := "ovs-vsctl list-br | tr '\n' '\n'"
+    //bridges, err := exec.Command("bash","-c",cmd1).CombinedOutput()
+    bridges, err := c.VSwitch.ListBridges()
+    if err != nil {
+            fmt.Printf("failed to get bridges: %v", err)
+    }else{
+ 
+
+    // $ sudo ovs-vsctl --may-exist add-br ovsbr0
+    for _, br := range bridges {
+      fmt.Print("\n\nBridge: ", string(br))
+      fmt.Print("\n")
+      //cmd2 := "ovs-vsctl list-ports "
+      //cmd22 := "tr '\n' '\n'"
+      ports, err := c.VSwitch.ListPorts(br)
+     
+      if err != nil {
+            fmt.Printf("failed to list ports: %v", err)
+      }else{
+        for _, p := range ports {
+           ifdata, err := exec.Command("ovs-vsctl","-f","csv","--columns=_uuid,name,admin_state,link_state,link_speed,error,duplex,link_resets,mtu,mac_in_use,ofport,status,type,statistics", "list", "Interface", p ).CombinedOutput()
+           if err != nil { 
+                  fmt.Printf("failed to get interface data: %v", err)
+            }else{
+              fmt.Print(p)
+              fmt.Print("\n\n\n\n")
+              fmt.Print(string(ifdata))
+              for key, element := range CSVToMapTest(string(ifdata)) {
+                ch <- prometheus.MustNewConstMetric(collector.ovsIntInfo,
+        	prometheus.CounterValue,
+        	metricValue,
+        	strings.TrimSuffix(string([]byte(hnameout)),"\n"),
+        	element["_uuid"],
+        	element["name"],
+        	element["admin_state"],
+        	element["link_state"],
+        	element["link_speed"],
+        	element["error"],
+        	element["duplex"],
+        	element["link_resets"],
+        	element["mtu"],
+        	element["mac_in_use"],
+        	element["ofport"],
+        	element["status"],
+        	element["type"])
+               fmt.Println("Key:", key, "=>", "Element:", element)
+                for _, element2 := range StatsCSV(string(element["statistics"])){
+                 fmt.Println("Key:", key, "=>", "Element:", element)
+                 ch <- prometheus.MustNewConstMetric(collector.ovsIntStats,
+       		 prometheus.CounterValue,
+       		 metricValue,
+       		 strings.TrimSuffix(string([]byte(hnameout)),"\n"),
+       		 p,
+       		 element2["collisions"],
+       		 element2["rx_bytes"],
+       		 element2["rx_crc_err"],
+       		 element2["rx_dropped"],
+       		 element2["rx_errors"],
+       		 element2["rx_frame_err"],
+       		 element2["rx_over_err"],
+       		 element2["rx_packets"],
+       		 element2["tx_bytes"],
+       		 element2["tx_dropped"],
+       		 element2["tx_errors"],
+       		 element2["tx_packets"])
+                 }
+               }
+
+            }
+          }
+        }
+      }
+    }
+  
+  }
+}
+
+func main() {
+
+  //Create a new instance of the foocollector and 
+  //register it with the prometheus client.
+  ocollector := newovsCollector()
+  prometheus.MustRegister(ocollector)
+
+  //This section will start the HTTP server and expose
+  //any metrics on the /metrics endpoint.
+  http.Handle("/metrics", promhttp.Handler())
+  log.Info("Beginning to serve on port :8888")
+  log.Fatal(http.ListenAndServe(":8888", nil))
+}

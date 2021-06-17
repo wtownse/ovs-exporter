@@ -1,0 +1,7 @@
+FROM scratch
+VOLUME /configs
+VOLUME /web
+ADD shoelaces /
+ADD web /web
+CMD ["/shoelaces","-data-dir=configs/data-dir","-domain=0.0.0.0"]
+EXPOSE 8081 8080 
